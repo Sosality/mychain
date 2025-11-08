@@ -1,9 +1,0 @@
-FROM node:18
-WORKDIR /app
-COPY node/package.json node/tsconfig.json ./ 
-COPY node/src ./src
-COPY node/data ./data
-RUN npm install
-RUN npm run build || true
-EXPOSE 4000
-CMD ["npm","run","dev"]
