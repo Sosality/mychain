@@ -1,84 +1,93 @@
-// server.js
-import express from 'express';
-import http from 'http';
-import { WebSocketServer } from 'ws';
-import crypto from 'crypto';
+const express = require("express");
+const path = require("path");
+const WebSocket = require("ws");
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
-app.use(express.static('public'));
-
-let chain = [];
+// Блокчейн состояние
+let blockchain = [];
 let mempool = [];
-let difficulty = 4;
-let reward = 50;
+let balances = {}; // Адрес → количество монет
 
-function sha256Hex(data) {
-  return crypto.createHash('sha256').update(data).digest('hex');
+// Пересчёт балансов по всей цепи
+function recalcBalances() {
+  balances = {};
+  for (const block of blockchain) {
+    for (const tx of block.transactions) {
+      if (!balances[tx.from]) balances[tx.from] = 0;
+      if (!balances[tx.to]) balances[tx.to] = 0;
+      balances[tx.from] -= tx.amount;
+      balances[tx.to] += tx.amount;
+    }
+  }
 }
 
+// Создать генезис-блок
 function createGenesis() {
-  const g = {
+  const block = {
     index: 0,
-    previousHash: '0'.repeat(64),
+    previousHash: "0".repeat(64),
     timestamp: Date.now(),
     transactions: [],
     nonce: 0,
-    hash: ''
+    hash: "0".repeat(64)
   };
-  g.hash = sha256Hex(JSON.stringify(g));
-  return g;
+  blockchain.push(block);
+  recalcBalances();
 }
-chain.push(createGenesis());
+createGenesis();
 
-function broadcast(type, payload) {
-  const msg = JSON.stringify({ type, payload });
-  for (const c of wss.clients) {
-    if (c.readyState === 1) c.send(msg);
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "public")));
+
+app.post("/tx", (req, res) => {
+  const tx = req.body;
+  if (!tx || !tx.from || !tx.to || typeof tx.amount !== "number") {
+    return res.status(400).json({ error: "Invalid transaction format" });
   }
-}
-
-function validBlock(b, prev) {
-  if (prev.index + 1 !== b.index) return false;
-  if (b.previousHash !== prev.hash) return false;
-  const header = `${b.index}|${b.previousHash}|${b.timestamp}|${JSON.stringify(b.transactions)}`;
-  const hash = sha256Hex(header + '|' + b.nonce);
-  if (hash !== b.hash) return false;
-  if (!hash.startsWith('0'.repeat(difficulty))) return false;
-  for (const t of b.transactions) {
-    if (t.amount <= 0) return false;
-  }
-  return true;
-}
-
-wss.on('connection', ws => {
-  ws.send(JSON.stringify({ type: 'init', payload: { chainTip: chain[chain.length-1], mempool, difficulty } }));
-  ws.on('message', msg => {
-    try {
-      const { type, payload } = JSON.parse(msg.toString());
-      if (type === 'tx') {
-        mempool.push(payload);
-        broadcast('mempool', mempool);
-      } else if (type === 'submitBlock') {
-        const b = payload;
-        const prev = chain[chain.length-1];
-        if (validBlock(b, prev)) {
-          const txset = new Set(b.transactions.map(t => JSON.stringify(t)));
-          mempool = mempool.filter(t => !txset.has(JSON.stringify(t)));
-          chain.push(b);
-          broadcast('newBlock', { block: b, difficulty });
-        } else {
-          ws.send(JSON.stringify({ type: 'reject', payload: 'invalid block' }));
-        }
-      } else if (type === 'getChain') {
-        ws.send(JSON.stringify({ type: 'chain', payload: chain }));
-      }
-    } catch(e){}
-  });
+  mempool.push(tx);
+  broadcast({ type: "mempool", mempool });
+  res.json({ status: "ok" });
 });
 
-const PORT = 3000;
-server.listen(PORT, () => console.log(`Server http://localhost:${PORT}`));
+app.get("/chain", (req, res) => {
+  res.json({ blockchain, balances });
+});
+
+const server = app.listen(PORT, () =>
+  console.log("Blockchain server running on port", PORT)
+);
+
+const wss = new WebSocket.Server({ server });
+
+function broadcast(msg) {
+  const data = JSON.stringify(msg);
+  wss.clients.forEach(ws => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(data);
+  });
+}
+
+wss.on("connection", (ws) => {
+  ws.send(JSON.stringify({ type: "init", chain: blockchain, mempool, balances }));
+
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+
+      if (data.type === "block") {
+        const block = data.block;
+        const last = blockchain[blockchain.length - 1];
+
+        if (block.previousHash === last.hash && block.index === last.index + 1) {
+          blockchain.push(block);
+          mempool = mempool.filter(tx =>
+            !block.transactions.find(t2 => JSON.stringify(t2) === JSON.stringify(tx))
+          );
+          recalcBalances();
+          broadcast({ type: "chain", chain: blockchain, mempool, balances });
+        }
+      }
+    } catch {}
+  });
+});
