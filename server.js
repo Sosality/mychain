@@ -511,7 +511,15 @@ const server = http.createServer(async (req, res) => {
 
 // Handle Upgrade header for WebSocket
 server.on('upgrade', (req, socket, head) => {
-  // only handle WebSocket upgrade
+  const { url } = req;
+
+  // Разрешаем webSocket только на /ws
+  if (url !== '/ws') {
+    socket.write('HTTP/1.1 404 Not Found\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
   const upgradeHeader = req.headers['upgrade'];
   if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
     socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
@@ -527,15 +535,17 @@ server.on('upgrade', (req, socket, head) => {
   }
 
   const acceptKey = computeWebSocketAccept(secKey);
+
   const responseHeaders = [
     'HTTP/1.1 101 Switching Protocols',
     'Upgrade: websocket',
     'Connection: Upgrade',
     'Sec-WebSocket-Accept: ' + acceptKey,
+    '\r\n'
   ];
 
-  socket.write(responseHeaders.join('\r\n') + '\r\n\r\n');
-  // now socket is a raw TCP socket speaking WS frames
+  socket.write(responseHeaders.join('\r\n'));
+
   attachWebSocket(socket);
 });
 
