@@ -1,243 +1,549 @@
-// mychain-server.js
-// Single-file Express app for wallet creation + transfers (server-side)
-// -------------------------------------------------------------
-// Features:
-// - GET / : serves single-page UI that lets user create wallets and send transfers
-// - POST /api/create : server-side generate BIP39 mnemonic and returns address + mnemonic + privateKey
-// - POST /api/send : server-side build and broadcast a transaction using the generated mnemonic
-// - Uses ethers.js and bip39. RPC node URL must be provided via environment variable RPC_URL
-// -------------------------------------------------------------
-// Security and deployment notes (read before using):
-// - This example is intentionally simple for learning. It transmits mnemonics/private keys
-//   between server and client and can sign & broadcast transactions on your behalf.
-// - DO NOT USE THIS FOR MAINNET FUNDS. For real funds, use hardware wallets, never expose
-//   private keys to web servers, and follow best practices.
-// - To test safely, use a testnet RPC (Sepolia, Goerli deprecated on many providers) and
-//   use testnet faucets for ETH.
+#!/usr/bin/env node
+/**
+ * blockchain.js
+ * Minimal single-file blockchain server (Node.js, no external packages).
+ * Дополненный WebSocket-интерфейс (минимальная реализация RFC6455).
+ *
+ * Запуск:
+ *   node blockchain.js
+ * Параметры окружения:
+ *   PORT (HTTP/WS порт, по умолчанию 3000)
+ *   DIFFICULTY (число ведущих нулей в hex для PoW, по умолчанию 3)
+ *
+ * HTTP API (как раньше):
+ *  GET  /chain       -> возвращает цепочку
+ *  GET  /pending     -> возвращает pending transactions
+ *  POST /transactions -> добавляет транзакцию (JSON body)
+ *  POST /mine        -> майнит блок с текущими транзакциями
+ *  POST /validate    -> валидирует текущую цепочку
+ *
+ * WebSocket:
+ *  - Подключение: ws://<host>:<PORT> с Upgrade-запросом WebSocket
+ *  - Протокол: текстовые JSON-сообщения.
+ *  - Команды (в JSON):
+ *      { "cmd": "getChain" }
+ *      { "cmd": "getPending" }
+ *      { "cmd": "addTx", "tx": { "sender":"a","recipient":"b","amount":12 } }
+ *      { "cmd": "mine" }
+ *      { "cmd": "validate" }
+ *  - Сервер отвечает JSON: { "ok": true/false, "id": optionalReqId, "result": ... , "error": ... }
+ *  - Сервер рассылает нотификации при событиях:
+ *      { "event":"newBlock", "block": { ... } }
+ *      { "event":"newTx", "tx": { ... } }
+ *
+ * Простой HTML-клиент (пример) см. внизу инструкции.
+ *
+ * Ограничения:
+ *  - Демонстрационный пример. Chain в памяти.
+ *  - WebSocket — минимальная реализация, для простого тестирования.
+ *
+ * Автор: сгенерировано нейросетью по вашему запросу.
+ */
 
-const express = require('express');
-const bip39 = require('bip39');
-const { ethers } = require('ethers');
+const http = require('http');
+const { URL } = require('url');
 const crypto = require('crypto');
-const helmet = require('helmet');
-const rateLimit = require('express-rate-limit');
+const net = require('net');
 
-const app = express();
-app.use(helmet());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ---------------- Configuration ----------------
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const DIFFICULTY = process.env.DIFFICULTY ? parseInt(process.env.DIFFICULTY, 10) : 3;
+const MINE_YIELD_ITERATIONS = 10000; // yield каждое N итераций
+// ------------------------------------------------
 
-// Basic rate limiting to reduce abuse
-app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+// In-memory blockchain state
+let chain = [];
+let pendingTransactions = [];
 
-const RPC_URL = process.env.RPC_URL || ''; // e.g. https://sepolia.infura.io/v3/<KEY>
-const CHAIN_NAME = process.env.CHAIN_NAME || 'sepolia';
-
-if (!RPC_URL) {
-  console.warn('Warning: RPC_URL not set. /api/send will fail until RPC_URL environment variable is provided.');
+/** Utility: SHA-256 hash of a string, returned as hex */
+function sha256(data) {
+  return crypto.createHash('sha256').update(data).digest('hex');
 }
 
-function generateMnemonic(words = 12) {
-  const entropyBytes = words === 12 ? 16 : 32;
-  const entropy = crypto.randomBytes(entropyBytes).toString('hex');
-  return bip39.entropyToMnemonic(entropy);
+/** Create the genesis block */
+function createGenesisBlock() {
+  const genesis = {
+    index: 0,
+    timestamp: new Date().toISOString(),
+    transactions: [],
+    nonce: 0,
+    previousHash: '0'.repeat(64),
+  };
+  genesis.hash = computeHashForBlock(genesis);
+  return genesis;
 }
 
-function walletFromMnemonic(mnemonic, path = "m/44'/60'/0'/0/0") {
-  return ethers.Wallet.fromMnemonic(mnemonic, path);
+/** Compute hash for a block object (uses index, timestamp, transactions, nonce, previousHash) */
+function computeHashForBlock(block) {
+  const blockString = `${block.index}|${block.timestamp}|${JSON.stringify(block.transactions)}|${block.nonce}|${block.previousHash}`;
+  return sha256(blockString);
 }
 
-app.get('/', (req, res) => {
-  res.send(`<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>MyChain — Wallet & Transfers</title>
-  <style>
-    body{font-family:system-ui,Segoe UI,Roboto,Arial;max-width:980px;margin:28px auto;padding:0 18px}
-    .card{border:1px solid #eee;border-radius:10px;padding:18px;margin-bottom:14px}
-    label{display:block;margin-top:8px}
-    input,select,button,textarea{font:inherit;padding:8px;margin-top:6px;width:100%;box-sizing:border-box}
-    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-    pre{background:#f6f7f9;padding:12px;border-radius:8px;overflow:auto}
-    small{color:#666}
-  </style>
-</head>
-<body>
-  <h1>MyChain — Создание кошелька и переводы</h1>
+/** Proof-of-Work check */
+function isValidProof(hash, difficulty) {
+  const prefix = '0'.repeat(difficulty);
+  return hash.startsWith(prefix);
+}
 
-  <div class="card">
-    <h2>1) Создать кошелёк</h2>
-    <p>Нажмите, чтобы сгенерировать BIP39 seed (mnemonic), адрес и приватный ключ (сервер сгенерирует и вернёт их).</p>
-    <p><button id="create">Создать кошелёк</button></p>
-    <div id="walletInfo" style="display:none">
-      <label>Seed-фраза (mnemonic)</label>
-      <pre id="mnemonic">-</pre>
-      <label>Адрес</label>
-      <code id="address">-</code>
-      <label>Приватный ключ</label>
-      <pre id="priv">-</pre>
-      <p><small>Скопируйте seed и храните его в безопасном месте. Приватный ключ виден — не используйте с реальными средствами.</small></p>
-    </div>
-  </div>
+/** Validate entire chain, return { valid: boolean, errors: [] } */
+function isValidChain(inputChain) {
+  const errors = [];
+  if (!Array.isArray(inputChain) || inputChain.length === 0) {
+    errors.push('Chain must be a non-empty array.');
+    return { valid: false, errors };
+  }
 
-  <div class="card">
-    <h2>2) Отправить перевод (на сервере)</h2>
-    <p>Введите seed-фразу (mnemonic) и данные транзакции. Сервер подпишет и отправит транзакцию через RPC node.</p>
-
-    <label>Seed-фраза (mnemonic)</label>
-    <textarea id="sendMnemonic" rows="2" placeholder="Введите mnemonic сюда"></textarea>
-
-    <div class="row">
-      <div>
-        <label>Кому (address)</label>
-        <input id="to" placeholder="0x..." />
-      </div>
-      <div>
-        <label>Сумма (ETH)</label>
-        <input id="amount" placeholder="0.01" />
-      </div>
-    </div>
-
-    <label>Gas limit (опционально)</label>
-    <input id="gasLimit" placeholder="21000" />
-
-    <p style="margin-top:8px">
-      <button id="send">Отправить транзакцию</button>
-    </p>
-
-    <div id="txResult" style="display:none">
-      <label>Результат</label>
-      <pre id="result">-</pre>
-    </div>
-  </div>
-
-  <div class="card">
-    <h2>Замечания безопасности</h2>
-    <ul>
-      <li>Эта страница отправляет ваш mnemonic на сервер. Это НЕ безопасно для реальных средств.</li>
-      <li>Для безопасной отправки подписывайте транзакции на клиенте или используйте hardware wallet.</li>
-      <li>Настройте RPC_URL в окружении перед включением отправки транзакций: <code>RPC_URL</code>.</li>
-    </ul>
-  </div>
-
-  <script>
-    async function postJSON(url, body) {
-      const res = await fetch(url, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-      if (!res.ok) throw new Error('HTTP ' + res.status + ' ' + await res.text());
-      return res.json();
+  for (let i = 0; i < inputChain.length; i++) {
+    const block = inputChain[i];
+    if (typeof block.index !== 'number' || typeof block.nonce !== 'number' || typeof block.hash !== 'string') {
+      errors.push(`Block at index ${i} has invalid structure.`);
+      continue;
     }
 
-    document.getElementById('create').addEventListener('click', async () => {
+    const recomputed = computeHashForBlock(block);
+    if (recomputed !== block.hash) {
+      errors.push(`Invalid hash at block ${i}: expected ${recomputed} got ${block.hash}`);
+    }
+
+    if (!isValidProof(block.hash, DIFFICULTY)) {
+      errors.push(`PoW not satisfied at block ${i} (difficulty ${DIFFICULTY}).`);
+    }
+
+    if (i > 0) {
+      const prev = inputChain[i - 1];
+      if (block.previousHash !== prev.hash) {
+        errors.push(`Block ${i} previousHash does not match hash of block ${i - 1}.`);
+      }
+    }
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
+/** Create a new block object (not yet mined) */
+function createBlock(transactions, previousHash) {
+  return {
+    index: chain.length,
+    timestamp: new Date().toISOString(),
+    transactions: Array.isArray(transactions) ? transactions : [],
+    nonce: 0,
+    previousHash: previousHash || (chain.length ? chain[chain.length - 1].hash : '0'.repeat(64)),
+    hash: '',
+  };
+}
+
+/** Async mining: tries nonces until PoW satisfied.
+ *  Returns Promise resolving to { block, miningTimeMs, iterations }.
+ */
+function mineBlockAsync(block, difficulty) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    let nonce = 0;
+    let iterations = 0;
+
+    function loop() {
       try {
-        const j = await postJSON('/api/create', {});
-        document.getElementById('mnemonic').textContent = j.mnemonic;
-        document.getElementById('address').textContent = j.address;
-        document.getElementById('priv').textContent = j.privateKey;
-        document.getElementById('walletInfo').style.display = 'block';
-      } catch (e) {
-        alert('Ошибка: ' + e.message);
+        for (let i = 0; i < MINE_YIELD_ITERATIONS; i++) {
+          block.nonce = nonce;
+          const hash = computeHashForBlock(block);
+          iterations++;
+          if (isValidProof(hash, difficulty)) {
+            block.hash = hash;
+            const miningTimeMs = Date.now() - start;
+            return resolve({ block, miningTimeMs, iterations });
+          }
+          nonce++;
+        }
+        // yield to event loop
+        setImmediate(loop);
+      } catch (err) {
+        return reject(err);
+      }
+    }
+
+    loop();
+  });
+}
+
+/** API helpers */
+function sendJSON(res, statusCode, obj) {
+  const body = JSON.stringify(obj);
+  res.writeHead(statusCode, {
+    'Content-Type': 'application/json',
+    'Content-Length': Buffer.byteLength(body),
+  });
+  res.end(body);
+}
+
+function parseRequestBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk.toString();
+      if (body.length > 1e6) {
+        req.connection.destroy();
+        reject(new Error('Request body too large'));
       }
     });
-
-    document.getElementById('send').addEventListener('click', async () => {
-      const mnemonic = document.getElementById('sendMnemonic').value.trim();
-      const to = document.getElementById('to').value.trim();
-      const amount = document.getElementById('amount').value.trim();
-      const gasLimit = document.getElementById('gasLimit').value.trim();
-
-      if (!mnemonic) return alert('Введите mnemonic');
-      if (!to) return alert('Введите адрес получателя');
-      if (!amount) return alert('Введите сумму');
-
-      document.getElementById('txResult').style.display = 'block';
-      document.getElementById('result').textContent = 'Отправка...';
-
+    req.on('end', () => {
+      if (!body) return resolve(null);
       try {
-        const payload = { mnemonic, to, amount, gasLimit: gasLimit || undefined };
-        const j = await postJSON('/api/send', payload);
-        document.getElementById('result').textContent = JSON.stringify(j, null, 2);
-      } catch (e) {
-        document.getElementById('result').textContent = 'Ошибка: ' + e.message;
+        const parsed = JSON.parse(body);
+        resolve(parsed);
+      } catch (err) {
+        reject(new Error('Invalid JSON'));
       }
     });
-  </script>
-</body>
-</html>`);
-});
+    req.on('error', err => reject(err));
+  });
+}
 
-// Create wallet endpoint
-app.post('/api/create', (req, res) => {
+/** Initialize chain with genesis block if empty */
+function ensureGenesis() {
+  if (chain.length === 0) {
+    const genesis = createGenesisBlock();
+    chain.push(genesis);
+  }
+}
+
+/** --- WebSocket minimal implementation --- **
+ * We'll accept Upgrade requests and implement basic frame parsing/sending.
+ * Supports only text frames (UTF-8), no fragmentation, clients MUST mask their frames (as per standard).
+ * Server sends unmasked frames.
+ */
+
+// Active websocket clients (store sockets and helper send)
+const wsClients = new Set();
+
+/** Compute Sec-WebSocket-Accept header value from client's key */
+function computeWebSocketAccept(key) {
+  const GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+  return crypto.createHash('sha1').update(key + GUID).digest('base64');
+}
+
+/** Send a text frame to a socket (server->client; unmasked) */
+function wsSendText(socket, message) {
+  if (socket.destroyed) return;
+  const payload = Buffer.from(String(message), 'utf8');
+  const payloadLen = payload.length;
+  let header;
+
+  if (payloadLen <= 125) {
+    header = Buffer.alloc(2);
+    header[0] = 0x81; // FIN=1, text frame
+    header[1] = payloadLen;
+  } else if (payloadLen <= 0xffff) {
+    header = Buffer.alloc(4);
+    header[0] = 0x81;
+    header[1] = 126;
+    header.writeUInt16BE(payloadLen, 2);
+  } else {
+    header = Buffer.alloc(10);
+    header[0] = 0x81;
+    header[1] = 127;
+    // write 64-bit length
+    // High 32 bits (0 since JS buffers limited) and low 32 bits:
+    header.writeUInt32BE(0, 2);
+    header.writeUInt32BE(payloadLen, 6);
+  }
+
+  const frame = Buffer.concat([header, payload]);
+  socket.write(frame);
+}
+
+/** Parse a single websocket frame from buffer; return {fin, opcode, payload, length, frameLen} or null if incomplete */
+function wsParseFrame(buffer) {
+  if (buffer.length < 2) return null;
+  const b1 = buffer[0];
+  const b2 = buffer[1];
+  const fin = (b1 & 0x80) !== 0;
+  const opcode = b1 & 0x0f;
+  const masked = (b2 & 0x80) !== 0;
+  let payloadLen = b2 & 0x7f;
+  let offset = 2;
+
+  if (payloadLen === 126) {
+    if (buffer.length < offset + 2) return null;
+    payloadLen = buffer.readUInt16BE(offset);
+    offset += 2;
+  } else if (payloadLen === 127) {
+    if (buffer.length < offset + 8) return null;
+    // Note: support lengths up to 2^53-1 isn't straightforward; we'll read low 32 bits
+    const high = buffer.readUInt32BE(offset);
+    const low = buffer.readUInt32BE(offset + 4);
+    // if high != 0 and payload too big, reject
+    if (high !== 0) throw new Error('Payload too big');
+    payloadLen = low;
+    offset += 8;
+  }
+
+  const maskKey = masked ? buffer.slice(offset, offset + 4) : null;
+  if (masked) {
+    if (buffer.length < offset + 4) return null;
+    offset += 4;
+  }
+
+  if (buffer.length < offset + payloadLen) return null;
+
+  let payload = buffer.slice(offset, offset + payloadLen);
+  if (masked && maskKey) {
+    // unmask
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] ^= maskKey[i % 4];
+    }
+  }
+
+  const frameLen = offset + payloadLen;
+  return {
+    fin,
+    opcode,
+    payload: payload.toString('utf8'),
+    length: payloadLen,
+    frameLen,
+  };
+}
+
+/** Broadcast JSON to all WS clients (text frame) */
+function broadcastWS(obj) {
+  const msg = JSON.stringify(obj);
+  for (const client of wsClients) {
+    try {
+      wsSendText(client.socket, msg);
+    } catch (err) {
+      // ignore send errors
+    }
+  }
+}
+
+/** Handle a newly accepted websocket socket */
+function attachWebSocket(socket) {
+  // track per-socket buffer
+  socket._wsBuffer = Buffer.alloc(0);
+  const client = { socket };
+  wsClients.add(client);
+
+  socket.on('data', data => {
+    // append to buffer and parse frames in a loop
+    socket._wsBuffer = Buffer.concat([socket._wsBuffer, Buffer.from(data)]);
+    try {
+      while (true) {
+        const frame = wsParseFrame(socket._wsBuffer);
+        if (!frame) break;
+        // remove processed bytes
+        socket._wsBuffer = socket._wsBuffer.slice(frame.frameLen);
+
+        // handle opcodes: 0x1 = text, 0x8 = close, 0x9 = ping, 0xA = pong
+        if (frame.opcode === 0x8) {
+          // close
+          try {
+            socket.end();
+          } catch (e) {}
+          wsClients.delete(client);
+          break;
+        } else if (frame.opcode === 0x9) {
+          // ping -> pong with same payload
+          const payload = Buffer.from(frame.payload, 'utf8');
+          // send pong (0xA)
+          const header = Buffer.alloc(2 + payload.length);
+          header[0] = 0x8A; // FIN=1, opcode=10
+          header[1] = payload.length;
+          const frameBuf = Buffer.concat([header, payload]);
+          socket.write(frameBuf);
+        } else if (frame.opcode === 0x1) {
+          // text frame
+          handleWSMessage(client, frame.payload);
+        } else {
+          // ignore other opcodes for simplicity
+        }
+      }
+    } catch (err) {
+      // parsing error -> close
+      try { socket.destroy(); } catch(e) {}
+      wsClients.delete(client);
+    }
+  });
+
+  socket.on('close', () => {
+    wsClients.delete(client);
+  });
+  socket.on('error', () => {
+    wsClients.delete(client);
+  });
+
+  // optionally send welcome
+  wsSendText(socket, JSON.stringify({ ok: true, event: 'welcome', message: 'Connected to simple blockchain ws' }));
+}
+
+/** Handle incoming WS JSON command (as text) */
+async function handleWSMessage(client, text) {
+  let obj;
   try {
-    const words = req.body.words === 24 ? 24 : 12;
-    const mnemonic = generateMnemonic(words);
-    const wallet = walletFromMnemonic(mnemonic);
-    res.json({ mnemonic, address: wallet.address, privateKey: wallet.privateKey });
+    obj = JSON.parse(text);
   } catch (err) {
-    res.status(500).json({ error: 'generation_failed', message: err.message });
+    wsSendText(client.socket, JSON.stringify({ ok: false, error: 'Invalid JSON' }));
+    return;
+  }
+
+  // optional id echo
+  const reqId = obj.id;
+
+  try {
+    if (!obj.cmd) {
+      wsSendText(client.socket, JSON.stringify({ ok: false, id: reqId, error: 'Missing cmd' }));
+      return;
+    }
+    if (obj.cmd === 'getChain') {
+      wsSendText(client.socket, JSON.stringify({ ok: true, id: reqId, result: { length: chain.length, chain } }));
+    } else if (obj.cmd === 'getPending') {
+      wsSendText(client.socket, JSON.stringify({ ok: true, id: reqId, result: { pendingCount: pendingTransactions.length, pendingTransactions } }));
+    } else if (obj.cmd === 'addTx') {
+      const tx = obj.tx;
+      if (!tx || typeof tx.sender !== 'string' || typeof tx.recipient !== 'string' || (typeof tx.amount !== 'number' && typeof tx.amount !== 'string')) {
+        wsSendText(client.socket, JSON.stringify({ ok: false, id: reqId, error: 'Invalid tx format' }));
+        return;
+      }
+      const txn = { sender: tx.sender, recipient: tx.recipient, amount: Number(tx.amount) };
+      pendingTransactions.push(txn);
+      wsSendText(client.socket, JSON.stringify({ ok: true, id: reqId, result: { message: 'Transaction added', tx: txn, index: chain.length } }));
+      // broadcast newTx to all clients
+      broadcastWS({ event: 'newTx', tx: txn });
+    } else if (obj.cmd === 'mine') {
+      // start mining and send result when done
+      const block = createBlock(pendingTransactions.slice(), chain.length ? chain[chain.length - 1].hash : undefined);
+      try {
+        const { block: minedBlock, miningTimeMs, iterations } = await mineBlockAsync(block, DIFFICULTY);
+        chain.push(minedBlock);
+        pendingTransactions = [];
+        const resp = { ok: true, id: reqId, result: { block: minedBlock, miningTimeMs, iterations } };
+        wsSendText(client.socket, JSON.stringify(resp));
+        // broadcast newBlock
+        broadcastWS({ event: 'newBlock', block: minedBlock });
+      } catch (err) {
+        wsSendText(client.socket, JSON.stringify({ ok: false, id: reqId, error: 'Mining failed', detail: String(err) }));
+      }
+    } else if (obj.cmd === 'validate') {
+      const result = isValidChain(chain);
+      wsSendText(client.socket, JSON.stringify({ ok: true, id: reqId, result }));
+    } else {
+      wsSendText(client.socket, JSON.stringify({ ok: false, id: reqId, error: 'Unknown cmd' }));
+    }
+  } catch (err) {
+    wsSendText(client.socket, JSON.stringify({ ok: false, id: reqId, error: 'Server error', detail: String(err) }));
+  }
+}
+
+/** --- HTTP server with Upgrade handling --- */
+ensureGenesis();
+
+const server = http.createServer(async (req, res) => {
+  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const pathname = parsedUrl.pathname;
+  try {
+    if (req.method === 'GET' && pathname === '/chain') {
+      return sendJSON(res, 200, { length: chain.length, chain });
+    }
+
+    if (req.method === 'GET' && pathname === '/pending') {
+      return sendJSON(res, 200, { pendingCount: pendingTransactions.length, pendingTransactions });
+    }
+
+    if (req.method === 'POST' && pathname === '/transactions') {
+      let body;
+      try {
+        body = await parseRequestBody(req);
+      } catch (err) {
+        return sendJSON(res, 400, { success: false, error: 'Invalid JSON body' });
+      }
+      if (!body || typeof body !== 'object') {
+        return sendJSON(res, 400, { success: false, error: 'Missing request body' });
+      }
+      const { sender, recipient, amount } = body;
+      if (typeof sender !== 'string' || typeof recipient !== 'string' || (typeof amount !== 'number' && typeof amount !== 'string')) {
+        return sendJSON(res, 400, { success: false, error: 'Invalid transaction format. Expect { sender, recipient, amount }' });
+      }
+      const tx = { sender, recipient, amount: Number(amount) };
+      pendingTransactions.push(tx);
+      // notify WS clients
+      broadcastWS({ event: 'newTx', tx });
+      const nextIndex = chain.length;
+      return sendJSON(res, 201, { success: true, message: 'Transaction added', index: nextIndex, tx });
+    }
+
+    if (req.method === 'POST' && pathname === '/mine') {
+      const block = createBlock(pendingTransactions.slice(), chain.length ? chain[chain.length - 1].hash : undefined);
+      try {
+        const { block: minedBlock, miningTimeMs, iterations } = await mineBlockAsync(block, DIFFICULTY);
+        chain.push(minedBlock);
+        pendingTransactions = [];
+        // notify WS clients
+        broadcastWS({ event: 'newBlock', block: minedBlock });
+        return sendJSON(res, 201, { success: true, block: minedBlock, miningTimeMs, iterations });
+      } catch (err) {
+        return sendJSON(res, 500, { success: false, error: 'Mining failed', detail: String(err) });
+      }
+    }
+
+    if (req.method === 'POST' && pathname === '/validate') {
+      const result = isValidChain(chain);
+      if (result.valid) {
+        return sendJSON(res, 200, { valid: true, message: 'Chain is valid', length: chain.length });
+      } else {
+        return sendJSON(res, 200, { valid: false, errors: result.errors });
+      }
+    }
+
+    // small landing page for quick manual check
+    if (req.method === 'GET' && pathname === '/') {
+      const info = {
+        message: 'Simple single-file blockchain. Use HTTP API or WebSocket.',
+        endpoints: ['/chain', '/pending', '/transactions (POST)', '/mine (POST)', '/validate (POST)'],
+        ws: 'ws://<host>:' + PORT,
+      };
+      return sendJSON(res, 200, info);
+    }
+
+    return sendJSON(res, 404, { error: 'Not found' });
+  } catch (err) {
+    console.error('Server error:', err);
+    return sendJSON(res, 500, { error: 'Internal server error', detail: String(err) });
   }
 });
 
-// Send transaction endpoint: accepts { mnemonic, to, amount, gasLimit }
-app.post('/api/send', async (req, res) => {
-  try {
-    const { mnemonic, to, amount, gasLimit } = req.body;
-    if (!mnemonic || !to || !amount) return res.status(400).json({ error: 'missing_parameters' });
-
-    if (!RPC_URL) return res.status(500).json({ error: 'rpc_not_configured', message: 'RPC_URL not set on server' });
-
-    // Basic validation
-    if (!bip39.validateMnemonic(mnemonic)) return res.status(400).json({ error: 'invalid_mnemonic' });
-    if (!ethers.utils.isAddress(to)) return res.status(400).json({ error: 'invalid_address' });
-
-    // Create provider and wallet
-    const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
-    const wallet = walletFromMnemonic(mnemonic).connect(provider);
-
-    // Build tx
-    const value = ethers.utils.parseEther(String(amount));
-    const tx = {
-      to,
-      value
-    };
-    if (gasLimit) tx.gasLimit = ethers.BigNumber.from(String(gasLimit));
-
-    // Optional: estimate gas if not provided
-    if (!tx.gasLimit) {
-      try {
-        const estimated = await wallet.estimateGas(tx);
-        tx.gasLimit = estimated;
-      } catch (e) {
-        tx.gasLimit = ethers.BigNumber.from(21000);
-      }
-    }
-
-    // Fill gas price / max fees depending on network
-    const feeData = await provider.getFeeData();
-    if (feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
-      tx.maxFeePerGas = feeData.maxFeePerGas;
-      tx.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
-    } else if (feeData.gasPrice) {
-      tx.gasPrice = feeData.gasPrice;
-    }
-
-    // Send tx
-    const sent = await wallet.sendTransaction(tx);
-    // Wait 1 confirmation but don't block too long
-    const receipt = await sent.wait(1);
-
-    res.json({
-      txHash: sent.hash,
-      blockNumber: receipt.blockNumber,
-      confirmations: receipt.confirmations,
-      gasUsed: receipt.gasUsed.toString()
-    });
-  } catch (err) {
-    console.error('send error', err);
-    res.status(500).json({ error: 'send_failed', message: err.message });
+// Handle Upgrade header for WebSocket
+server.on('upgrade', (req, socket, head) => {
+  // only handle WebSocket upgrade
+  const upgradeHeader = req.headers['upgrade'];
+  if (!upgradeHeader || upgradeHeader.toLowerCase() !== 'websocket') {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
   }
+
+  const secKey = req.headers['sec-websocket-key'];
+  if (!secKey) {
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+
+  const acceptKey = computeWebSocketAccept(secKey);
+  const responseHeaders = [
+    'HTTP/1.1 101 Switching Protocols',
+    'Upgrade: websocket',
+    'Connection: Upgrade',
+    'Sec-WebSocket-Accept: ' + acceptKey,
+  ];
+
+  socket.write(responseHeaders.join('\r\n') + '\r\n\r\n');
+  // now socket is a raw TCP socket speaking WS frames
+  attachWebSocket(socket);
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`MyChain server listening on port ${PORT}`));
+server.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+  console.log(`Difficulty: ${DIFFICULTY} leading zeros (hex).`);
+  console.log(`HTTP endpoints: GET /, GET /chain, GET /pending, POST /transactions, POST /mine, POST /validate`);
+  console.log(`WebSocket: ws://<host>:${PORT} (send JSON commands)`);
+});
+
+/** --- End of file --- */
